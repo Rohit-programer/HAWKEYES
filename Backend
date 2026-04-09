@@ -1,0 +1,208 @@
+"""
+AI Future Simulator - Backend (FastAPI)
+Run with: uvicorn main:app --reload --port 8000
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from pydantic import BaseModel
+from typing import Optional
+import sqlite3
+import json
+import datetime
+
+# ─── App Setup ───────────────────────────────────────────────
+app = FastAPI(title="AI Decision Simulator API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── OpenAI Client ───────────────────────────────────────────
+# Replace with your actual OpenAI API key
+import os
+client = OpenAI(api_key=os.getenv("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"))
+# ─── Database Setup ──────────────────────────────────────────
+DB_PATH = "simulator.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS simulations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision    TEXT NOT NULL,
+            category    TEXT,
+            budget      REAL,
+            duration    INTEGER,
+            risk_level  TEXT,
+            ai_result   TEXT,
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()  # Run on startup
+
+# ─── Pydantic Models ─────────────────────────────────────────
+class SimulationRequest(BaseModel):
+    decision: str
+    category: str = "general"
+    budget: float = 0.0
+    duration: int = 3          # years
+    risk_level: str = "medium" # low | medium | high
+
+class SimulationResponse(BaseModel):
+    id: int
+    decision: str
+    result: dict
+    created_at: str
+
+# ─── AI Simulation Engine ────────────────────────────────────
+def build_prompt(req: SimulationRequest) -> str:
+    return f"""
+You are a strategic future simulation AI. Simulate a realistic {req.duration}-year future for someone who chooses:
+
+Decision: {req.decision}
+Category: {req.category}
+Budget: ${req.budget:,.2f}
+Risk level: {req.risk_level}
+Time horizon: {req.duration} years
+
+Respond ONLY with a valid JSON object (no markdown, no explanation) with this exact structure:
+{{
+  "summary": "2-3 sentence executive overview of the outcome",
+  "success_probability": <integer 0-100>,
+  "financial_outcome": {{
+    "initial_investment": {req.budget},
+    "projected_return": <number>,
+    "roi_percent": <number>,
+    "break_even_months": <integer>
+  }},
+  "yearly_timeline": [
+    {{
+      "year": 1,
+      "title": "short title",
+      "description": "what happens this year",
+      "financial_position": <number>,
+      "milestone": "key achievement"
+    }}
+  ],
+  "risks": [
+    {{
+      "risk": "risk name",
+      "severity": "low|medium|high",
+      "probability_percent": <integer>,
+      "mitigation": "how to handle it"
+    }}
+  ],
+  "opportunities": [
+    {{
+      "opportunity": "opportunity name",
+      "impact": "low|medium|high",
+      "action": "how to capture it"
+    }}
+  ],
+  "recommendation": "single concrete actionable recommendation",
+  "alternative_paths": [
+    {{
+      "path": "alternative approach name",
+      "description": "brief description",
+      "success_probability": <integer>
+    }}
+  ]
+}}
+Only return the JSON. No markdown fences. No extra text.
+"""
+
+def run_simulation(req: SimulationRequest) -> dict:
+    prompt = build_prompt(req)
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a precise strategic simulation engine. Always return only valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7,
+        max_tokens=2000
+    )
+    raw = response.choices[0].message.content.strip()
+    # Strip possible markdown fences just in case
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+# ─── Database Helpers ────────────────────────────────────────
+def save_simulation(req: SimulationRequest, result: dict) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO simulations (decision, category, budget, duration, risk_level, ai_result)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (req.decision, req.category, req.budget, req.duration, req.risk_level, json.dumps(result)))
+    conn.commit()
+    sim_id = cursor.lastrowid
+    conn.close()
+    return sim_id
+
+def fetch_simulation(sim_id: int) -> Optional[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM simulations WHERE id = ?", (sim_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "decision": row[1], "category": row[2],
+        "budget": row[3], "duration": row[4], "risk_level": row[5],
+        "ai_result": json.loads(row[6]), "created_at": row[7]
+    }
+
+def fetch_all_simulations() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, decision, category, risk_level, created_at FROM simulations ORDER BY id DESC LIMIT 20")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "decision": r[1], "category": r[2], "risk_level": r[3], "created_at": r[4]} for r in rows]
+
+# ─── API Routes ──────────────────────────────────────────────
+@app.post("/simulate", response_model=dict)
+async def simulate(req: SimulationRequest):
+    try:
+        result = run_simulation(req)
+        sim_id = save_simulation(req, result)
+        return {"id": sim_id, "decision": req.decision, "result": result, "created_at": str(datetime.datetime.now())}
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {str(e)}")
+    except Exception as e:
+        print("ERROR  OCCURED",e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/simulations")
+async def get_all():
+    return fetch_all_simulations()
+
+@app.get("/simulations/{sim_id}")
+async def get_simulation(sim_id: int):
+    sim = fetch_simulation(sim_id)
+    if not sim:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    return sim
+
+@app.delete("/simulations/{sim_id}")
+async def delete_simulation(sim_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM simulations WHERE id = ?", (sim_id,))
+    conn.commit()
+    conn.close()
+    return {"deleted": sim_id}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
